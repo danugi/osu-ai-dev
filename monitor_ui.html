@@ -1,0 +1,331 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>osu! AI Monitor</title>
+<style>
+  /* Полностью прозрачный фон -> наложение в OBS. Никаких внешних ресурсов. */
+  :root{
+    --bg: transparent;
+    --panel: rgba(12,16,24,0.55);
+    --panel-border: rgba(90,200,255,0.18);
+    --text: #dfeaff;
+    --muted: #7f8ea8;
+    --accent: #4fd1ff;
+    --accent2: #a78bfa;
+    --ok: #38e08b;
+    --warn: #ffcc4d;
+    --bad: #ff5c7a;
+    --mono: 'Segoe UI', system-ui, -apple-system, Roboto, Arial, sans-serif;
+  }
+  *{ box-sizing:border-box; }
+  html,body{ margin:0; padding:0; background:var(--bg); color:var(--text);
+    font-family:var(--mono); -webkit-font-smoothing:antialiased; overflow:hidden; }
+  body{ padding:14px; user-select:none; cursor:default; }
+
+  #wrap{ display:grid; grid-template-columns: repeat(12, 1fr); gap:10px;
+    max-width:720px; }
+  .panel{ grid-column: span 4; background:var(--panel);
+    border:1px solid var(--panel-border); border-radius:10px; padding:9px 11px;
+    backdrop-filter: blur(2px); }
+  .panel.wide{ grid-column: span 12; }
+  .panel.half{ grid-column: span 6; }
+  .p-head{ display:flex; align-items:center; justify-content:space-between;
+    font-size:11px; letter-spacing:.14em; text-transform:uppercase;
+    color:var(--muted); margin-bottom:7px; }
+  .p-head .toggle{ cursor:pointer; color:var(--muted); font-size:12px;
+    border:none; background:none; padding:0 2px; }
+  .p-head .toggle:hover{ color:var(--accent); }
+  .panel.collapsed .p-body{ display:none; }
+  .panel.collapsed{ padding-bottom:9px; }
+
+  .row{ display:flex; align-items:baseline; justify-content:space-between;
+    gap:10px; padding:2px 0; font-size:13px; }
+  .row .k{ color:var(--muted); font-size:11.5px; }
+  .row .v{ font-variant-numeric: tabular-nums; font-weight:600; }
+  .big{ font-size:22px; font-weight:700; letter-spacing:.01em; }
+  .accent{ color:var(--accent); } .accent2{ color:var(--accent2); }
+
+  /* Статус-бар с точками компонентов */
+  #status{ grid-column: span 12; display:flex; gap:16px; flex-wrap:wrap;
+    background:var(--panel); border:1px solid var(--panel-border);
+    border-radius:10px; padding:9px 13px; }
+  .dot{ display:flex; align-items:center; gap:7px; font-size:12px;
+    letter-spacing:.06em; }
+  .dot i{ width:10px; height:10px; border-radius:50%; background:#3a465c;
+    box-shadow:0 0 0 0 rgba(0,0,0,0); transition:background .2s; }
+  .dot.on i{ background:var(--ok); box-shadow:0 0 8px 1px rgba(56,224,139,.6); }
+  .dot.off i{ background:var(--bad); box-shadow:0 0 8px 1px rgba(255,92,122,.5); }
+  .dot.warn i{ background:var(--warn); }
+
+  /* Хит-статистика */
+  .hits{ display:flex; gap:8px; margin-top:2px; }
+  .hits .h{ flex:1; text-align:center; padding:5px 0; border-radius:7px;
+    background:rgba(255,255,255,.04); border:1px solid rgba(255,255,255,.05); }
+  .hits .h b{ display:block; font-size:16px; font-variant-numeric:tabular-nums; }
+  .hits .h span{ font-size:10px; color:var(--muted); letter-spacing:.1em; }
+  .h.c300 b{ color:#6fd3ff; } .h.c100 b{ color:#7ee0a0; }
+  .h.c50 b{ color:#ffd166; } .h.miss b{ color:#ff6b81; }
+
+  canvas{ display:block; width:100%; height:54px; }
+  .chart-label{ font-size:10px; color:var(--muted); letter-spacing:.1em;
+    text-transform:uppercase; margin-bottom:3px; }
+
+  /* Кнопки управления */
+  .ctrls{ display:flex; gap:7px; flex-wrap:wrap; }
+  .ctrls button{ flex:1; min-width:70px; font:inherit; font-size:11.5px;
+    letter-spacing:.06em; color:var(--text); background:rgba(80,140,200,.14);
+    border:1px solid var(--panel-border); border-radius:8px; padding:7px 4px;
+    cursor:pointer; }
+  .ctrls button:hover{ background:rgba(80,160,220,.28); border-color:var(--accent); }
+  .ctrls button:active{ transform:translateY(1px); }
+  .ctrls button.off{ opacity:.4; cursor:not-allowed; }
+
+  #footer{ grid-column:span 12; font-size:10px; color:var(--muted);
+    text-align:right; padding:0 4px; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <div id="status">
+    <div class="dot" id="d-ai"><i></i>AI ONLINE</div>
+    <div class="dot" id="d-tosu"><i></i>TOSU CONNECTED</div>
+    <div class="dot" id="d-model"><i></i>MODEL LOADED</div>
+    <div class="dot" id="d-train"><i></i>TRAINING</div>
+  </div>
+
+  <!-- Игра (из tosu) -->
+  <div class="panel half" data-key="game">
+    <div class="p-head"><span>Game &middot; tosu</span><button class="toggle">&#9662;</button></div>
+    <div class="p-body">
+      <div class="row"><span class="k">Score</span><span class="v big accent" id="g-score">N/A</span></div>
+      <div class="row"><span class="k">Accuracy</span><span class="v big" id="g-acc">N/A</span></div>
+      <div class="row"><span class="k">Combo</span><span class="v big" id="g-combo">N/A</span></div>
+      <div class="row"><span class="k">Max combo</span><span class="v" id="g-maxcombo">N/A</span></div>
+      <div class="hits">
+        <div class="h c300"><b id="h300">0</b><span>300</span></div>
+        <div class="h c100"><b id="h100">0</b><span>100</span></div>
+        <div class="h c50"><b id="h50">0</b><span>50</span></div>
+        <div class="h miss"><b id="hmiss">0</b><span>MISS</span></div>
+      </div>
+      <div class="row" style="margin-top:6px"><span class="k">Map</span><span class="v" id="g-map" style="font-size:11px;color:var(--muted)">N/A</span></div>
+      <div class="row"><span class="k">Mods / state</span><span class="v" id="g-mods">N/A</span></div>
+    </div>
+  </div>
+
+  <!-- AI (из процесса) -->
+  <div class="panel half" data-key="ai">
+    <div class="p-head"><span>AI runtime</span><button class="toggle">&#9662;</button></div>
+    <div class="p-body">
+      <div class="row"><span class="k">Status</span><span class="v big" id="a-status">STOPPED</span></div>
+      <div class="row"><span class="k">FPS</span><span class="v" id="a-fps">N/A</span></div>
+      <div class="row"><span class="k">Inference</span><span class="v" id="a-infer">N/A</span></div>
+      <div class="row"><span class="k">Step reward</span><span class="v" id="a-sreward">N/A</span></div>
+      <div class="row"><span class="k">Episode reward</span><span class="v accent" id="a-ereward">N/A</span></div>
+      <div class="row"><span class="k">Action</span><span class="v" id="a-action">N/A</span></div>
+      <div class="row"><span class="k">Cursor (state)</span><span class="v" id="a-cursor">N/A</span></div>
+    </div>
+  </div>
+
+  <!-- Обучение -->
+  <div class="panel half" data-key="train">
+    <div class="p-head"><span>Training</span><button class="toggle">&#9662;</button></div>
+    <div class="p-body">
+      <div class="row"><span class="k">Loss</span><span class="v accent2" id="t-loss">N/A</span></div>
+      <div class="row"><span class="k">Training step</span><span class="v" id="t-steps">N/A</span></div>
+      <div class="row"><span class="k">Model / checkpoint</span><span class="v" id="t-model" style="font-size:11px">N/A</span></div>
+    </div>
+  </div>
+
+  <!-- Система + связь -->
+  <div class="panel half" data-key="sys">
+    <div class="p-head"><span>System &amp; link</span><button class="toggle">&#9662;</button></div>
+    <div class="p-body">
+      <div class="row"><span class="k">CPU</span><span class="v" id="s-cpu">N/A</span></div>
+      <div class="row"><span class="k">GPU</span><span class="v" id="s-gpu">N/A</span></div>
+      <div class="row"><span class="k">VRAM</span><span class="v" id="s-vram">N/A</span></div>
+      <div class="row"><span class="k">AI &harr; tosu</span><span class="v" id="s-aiconn">N/A</span></div>
+      <div class="row"><span class="k">Missed telemetry</span><span class="v" id="s-errs">N/A</span></div>
+    </div>
+  </div>
+
+  <!-- Графики -->
+  <div class="panel wide" data-key="charts">
+    <div class="p-head"><span>Trends</span><button class="toggle">&#9662;</button></div>
+    <div class="p-body">
+      <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px">
+        <div><div class="chart-label">Reward</div><canvas id="ch-reward"></canvas></div>
+        <div><div class="chart-label">Loss</div><canvas id="ch-loss"></canvas></div>
+        <div><div class="chart-label">Accuracy</div><canvas id="ch-acc"></canvas></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Управление (действует только пока запущен play.py) -->
+  <div class="panel wide" data-key="ctrl">
+    <div class="p-head"><span>Controls <span style="color:var(--muted);text-transform:none;letter-spacing:0">— active when play.py runs</span></span><button class="toggle">&#9662;</button></div>
+    <div class="p-body">
+      <div class="ctrls">
+        <button data-cmd="pause">PAUSE</button>
+        <button data-cmd="resume">RESUME</button>
+        <button data-cmd="save">SAVE MODEL</button>
+        <button data-cmd="reload">RELOAD MODEL</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="footer">waiting for monitor…</div>
+</div>
+
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+const fmt = (v, suffix="", digits) => {
+  if (v === null || v === undefined || v === "" ) return "N/A";
+  if (typeof v === "number") {
+    let s = (digits !== undefined) ? v.toFixed(digits) : String(v);
+    return s + suffix;
+  }
+  return String(v) + suffix;
+};
+const MAXPTS = 120;   // ограничение точек -> память не растёт бесконечно
+
+// --- кольцевые буферы графиков ---
+function mkChart(canvasId, color){
+  const cv = $(canvasId), ctx = cv.getContext("2d");
+  const data = [];
+  return {
+    push(v){
+      data.push((v === null || v === undefined) ? null : Number(v));
+      if (data.length > MAXPTS) data.shift();
+    },
+    draw(){
+      const w = cv.clientWidth, h = cv.clientHeight, dpr = window.devicePixelRatio || 1;
+      if (cv.width !== w*dpr || cv.height !== h*dpr){ cv.width = w*dpr; cv.height = h*dpr; }
+      ctx.setTransform(dpr,0,0,dpr,0,0);
+      ctx.clearRect(0,0,w,h);
+      // фоновая базовая линия
+      ctx.strokeStyle = "rgba(255,255,255,.06)"; ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(0,h-1); ctx.lineTo(w,h-1); ctx.stroke();
+      const nums = data.filter(x => x !== null && isFinite(x));
+      if (nums.length < 2) return;
+      let mn = Math.min(...nums), mx = Math.max(...nums);
+      if (mx - mn < 1e-6){ mx = mn + 1; }
+      const pad = 3;
+      ctx.strokeStyle = color; ctx.lineWidth = 1.6; ctx.lineJoin = "round";
+      ctx.beginPath();
+      for (let i=0;i<data.length;i++){
+        const v = data[i]; if (v === null) continue;
+        const x = (i/(MAXPTS-1))*w;
+        const y = pad + (h-2*pad) * (1 - (v-mn)/(mx-mn));
+        ctx.lineTo(x,y);
+      }
+      ctx.stroke();
+    }
+  };
+}
+const chReward = mkChart("ch-reward", "#4fd1ff");
+const chLoss   = mkChart("ch-loss",   "#a78bfa");
+const chAcc    = mkChart("ch-acc",    "#38e08b");
+
+// --- сворачивание панелей (по клику на заголовок) ---
+document.querySelectorAll(".panel").forEach(p => {
+  p.querySelector(".toggle").addEventListener("click", () => {
+    p.classList.toggle("collapsed");
+    p.querySelector(".toggle").innerHTML =
+      p.classList.contains("collapsed") ? "&#9656;" : "&#9662;";
+  });
+});
+
+// --- управление ---
+let ws = null;
+function sendCmd(cmd){
+  if (ws && ws.readyState === 1) ws.send(JSON.stringify({type:"command", cmd}));
+}
+document.querySelectorAll(".ctrls button").forEach(b => {
+  b.addEventListener("click", () => sendCmd(b.dataset.cmd));
+});
+
+function setDot(id, on, warn){
+  const el = $(id);
+  el.classList.remove("on","off","warn");
+  if (warn && !on) el.classList.add("warn");
+  else el.classList.add(on ? "on" : "off");
+}
+
+function render(s){
+  const ai = s.ai || {}, to = s.tosu || {}, sy = s.sys || {};
+
+  // статус-бар
+  setDot("d-ai", ai.status === "RUNNING");
+  setDot("d-tosu", !!to.connected);
+  setDot("d-model", !!ai.model_loaded);
+  setDot("d-train", !!ai.training);
+
+  // game
+  $("g-score").textContent = to.score != null ? to.score.toLocaleString() : "N/A";
+  $("g-acc").textContent   = fmt(to.accuracy, to.accuracy != null ? "%" : "");
+  $("g-combo").textContent = to.combo != null ? String(to.combo) : "N/A";
+  $("g-maxcombo").textContent = to.max_combo != null ? String(to.max_combo) : "N/A";
+  const hits = to.hits || {};
+  $("h300").textContent = hits["300"] != null ? hits["300"] : "0";
+  $("h100").textContent = hits["100"] != null ? hits["100"] : "0";
+  $("h50").textContent  = hits["50"]  != null ? hits["50"]  : "0";
+  $("hmiss").textContent= hits["miss"]!= null ? hits["miss"]: "0";
+  $("g-map").textContent = to.map || "N/A";
+  $("g-mods").textContent = (to.mods || "N/A") + " · " + (to.state || "N/A");
+
+  // ai runtime
+  const st = ai.status || "STOPPED";
+  const stEl = $("a-status"); stEl.textContent = st;
+  stEl.style.color = st === "RUNNING" ? "var(--ok)" : (st === "PAUSED" ? "var(--warn)" : "var(--muted)");
+  $("a-fps").textContent     = fmt(ai.fps, ai.fps != null ? "" : "");
+  $("a-infer").textContent   = fmt(ai.inference_ms, ai.inference_ms != null ? " ms" : "", 2);
+  $("a-sreward").textContent = fmt(ai.step_reward, "", 3);
+  $("a-ereward").textContent = fmt(ai.episode_reward, "", 2);
+  $("a-action").textContent  = ai.action ? "["+ai.action.join(", ")+"]" : "N/A";
+  const c = ai.cursor;
+  $("a-cursor").textContent  = (c && c.x != null) ? (c.x.toFixed(0)+", "+c.y.toFixed(0)) : "N/A";
+
+  // training
+  $("t-loss").textContent  = fmt(ai.loss, "", ai.loss != null && ai.loss < 1 ? 4 : 3);
+  $("t-steps").textContent = ai.train_steps != null ? ai.train_steps.toLocaleString() : "N/A";
+  $("t-model").textContent = ai.model || "N/A";
+
+  // system & link
+  $("s-cpu").textContent  = fmt(sy.cpu, sy.cpu != null ? "%" : "");
+  $("s-gpu").textContent  = fmt(sy.gpu, sy.gpu != null ? "%" : "");
+  $("s-vram").textContent = (sy.vram_used_mb != null)
+      ? (sy.vram_used_mb + " / " + sy.vram_total_mb + " MB") : "N/A";
+  $("s-aiconn").textContent = ai.ai_connection == null ? "N/A" : (ai.ai_connection ? "OK" : "LOST");
+  const errs = (to.errors != null ? to.errors : 0) + (ai.telemetry_errors != null ? ai.telemetry_errors : 0);
+  $("s-errs").textContent = fmt(ai.telemetry_errors != null ? ai.telemetry_errors : (to.errors || 0), errs > 0 ? "" : "");
+
+  // графики
+  chReward.push(ai.episode_reward);
+  chLoss.push(ai.loss);
+  chAcc.push(to.accuracy);
+}
+
+let latest = null;
+function frame(){
+  if (latest) render(latest);
+  chReward.draw(); chLoss.draw(); chAcc.draw();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+// --- WebSocket с автопереподключением ---
+function connect(){
+  const proto = location.protocol === "https:" ? "wss" : "ws";
+  ws = new WebSocket(proto + "://" + location.host + "/");
+  ws.onopen = () => { $("footer").textContent = "connected · " + location.host; };
+  ws.onmessage = ev => { try { latest = JSON.parse(ev.data); $("footer").textContent =
+      "live · " + new Date().toLocaleTimeString(); } catch(e){} };
+  ws.onclose = () => { $("footer").textContent = "reconnecting…"; setTimeout(connect, 1500); };
+  ws.onerror = () => { try { ws.close(); } catch(e){} };
+}
+connect();
+</script>
+</body>
+</html>
