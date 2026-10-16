@@ -7,7 +7,7 @@ import vision
 # ============================================================
 # НАСТРОЙКИ
 # ============================================================
-API_KEY = "e59e516a875b09cdb3be7bff2a7ed13ef66afcb0"   # ключ v1 (osu.ppy.sh/home/account/edit -> Legacy API). Нужен только для set/map
+API_KEY = ""   # ключ v1 (osu.ppy.sh/home/account/edit -> Legacy API). Нужен только для set/map
 
 MAP_DIR = "sim_maps"
 MANIFEST = os.path.join(MAP_DIR, "manifest.json")
