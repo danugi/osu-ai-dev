@@ -24,11 +24,10 @@ except Exception:         # noqa: BLE001
 
 N_ENVS = 10
 TB_LOG_DIR = "logs_sim"
-
 # SB3: eval_freq/save_freq считаются в ВЫЗОВАХ vec-env.
 # 20_000 вызовов * 10 env = 200k шагов среды между событиями.
 EVAL_EVERY = 20_000
-
+N_STACK = 4
 try:
     import tqdm   # noqa: F401
     import rich   # noqa: F401
@@ -154,7 +153,7 @@ def make_vec(paths, n, hr=0.0, teleport=0.0):
     env = SubprocVecEnv(
         [lambda: Monitor(SimOsuEnv(paths, hr_prob=hr, teleport_prob=teleport)) for _ in range(n)]
     )
-    env = VecFrameStack(env, n_stack=8, channels_order="last")   # 60HZ: было 4
+    env = VecFrameStack(env, n_stack=N_STACK, channels_order="last")  # 60HZ: было 4
     env = VecTransposeImage(env)
     return env
 
@@ -218,7 +217,7 @@ def interactive():
     pool = ask("Пул карт (папка:вес,...)", default_pool)
     eval_new = ask("Eval нового тира (папка)", default_eval)
     eval_old = ask("Eval старого тира [нет]", default_old) or None
-    resume = ask("Веса для старта (.zip) [с нуля]", "bc_policy.zip") or None
+    resume = ask("Веса для старта (.zip), Enter = с нуля", "") or None
     steps = ask_int("Шагов", 4_000_000)
     lr = ask_float("Learning rate (пик)", 1e-5)
     name = ask("Имя стадии", "stage2")

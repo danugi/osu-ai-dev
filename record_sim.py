@@ -1,20 +1,34 @@
 import glob
+import os
 import numpy as np
 import cv2
 from stable_baselines3 import PPO
 from sim_env import SimOsuEnv
 
-MODEL = "checkpoints_stage1new/stage1new_3000000_steps.zip"
+
+def infer_stack(model):
+    """Стек из первой свёртки политики: 8 = 60Гц-линия, 4 = старые 30Гц."""
+    try:
+        return int(model.policy.features_extractor.cnn[0].in_channels)
+    except Exception:
+        return 8
+
+
+_cands = sorted(glob.glob("best_*/*.zip") + glob.glob("*_final.zip")
+                + glob.glob("checkpoints_*/*_steps.zip"), key=os.path.getmtime)
+MODEL = _cands[-1] if _cands else "checkpoints_stage1new/stage1new_3000000_steps.zip"
 OUT = "sim_episode.mp4"
 SPEED = 0.5          # 0.5 = замедлить вдвое, 1.0 = реальная скорость
 EP_SEED = 1001       # тот же сид, что в diagnose — эпизод 1, её лучший
 
 model = PPO.load(MODEL, device="cpu")
+K = infer_stack(model)
+print(f"Модель: {MODEL} | стек {K} кадров")
 maps = sorted(glob.glob("sim_maps_eval/*.osu"))
 env = SimOsuEnv(maps)
 
 obs, _ = env.reset(seed=EP_SEED)
-s = np.repeat(obs, 4, axis=2)
+s = np.repeat(obs, K, axis=2)
 
 # 160x120 слишком мелкий для просмотра — апскейлим x4
 vw, vh = env.obs_shape[1] * 4, env.obs_shape[0] * 4

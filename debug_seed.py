@@ -6,12 +6,26 @@ from bisect import bisect_left, bisect_right
 from stable_baselines3 import PPO
 from sim_env import SimOsuEnv
 
+
+def infer_stack(model):
+    """Стек из первой свёртки политики: 8 = 60Гц-линия, 4 = старые 30Гц."""
+    try:
+        return int(model.policy.features_extractor.cnn[0].in_channels)
+    except Exception:
+        return 8
+
 seed = int(sys.argv[1]) if len(sys.argv) > 1 else 1008
-ck = sys.argv[2] if len(sys.argv) > 2 else \
-     max(glob.glob("checkpoints_bcft/*_steps.zip"),
-         key=lambda p: int(p.split("_")[-2]))
+if len(sys.argv) > 2:
+    ck = sys.argv[2]
+else:
+    _cands = sorted(glob.glob("checkpoints_*/*_steps.zip"), key=os.path.getmtime)
+    ck = _cands[-1] if _cands else None
+    if ck is None:
+        raise SystemExit("нет чекпоинтов — укажи: python debug_seed.py <seed> <model.zip>")
 print("Модель:", ck, "| seed:", seed)
 model = PPO.load(ck, device="cpu")
+K = infer_stack(model)
+print(f"стек модели: {K} кадров")
 
 maps = sorted(glob.glob("sim_maps_eval/*.osu"))
 env = SimOsuEnv(maps)
@@ -28,7 +42,7 @@ def _spy(i, pt, head):
 env._judge_hit = _spy
 
 os.makedirs("debug_frames", exist_ok=True)
-s = np.repeat(obs, 4, axis=2)
+s = np.repeat(obs, K, axis=2)
 done, prev_l, step_i, total = False, False, 0, 0.0
 while not done:
     t_now, cx, cy = env.sim_time, env.cursor_x, env.cursor_y

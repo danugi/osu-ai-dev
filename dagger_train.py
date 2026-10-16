@@ -1,5 +1,5 @@
 # dagger_train.py — одна итерация DAgger на 60Гц-семантике деплоя (env.py as-is)»
-# iter1: python dagger_train.py --iter 1 --base best_stage2b/stage2b_800000_steps.zip --oracle-share 0.5
+# iter1: python dagger_train.py --iter 1 --base <свежая модель 60Гц/стек-8> --oracle-share 0.5
 # iter2: python dagger_train.py --iter 2 --resume-bc dagger_iter1_bcnet.pt --oracle-share 0.33
 # iter3: python dagger_train.py --iter 3 --resume-bc dagger_iter2_bcnet.pt --oracle-share 0.2
 # from-scratch (если reverse-check не сошёлся): iter1 без --base.
@@ -19,13 +19,18 @@ from bc_train import BCNet, oracle_policy, aux_target
 TRAIN_EVERY, BATCH, LR, WARMUP, BUF_SIZE = 4, 256, 3e-4, 2048, 30_000
 ACT_NOISE_ORACLE = 0.03        # шум исполнения ТОЛЬКО в oracle-эпизодах
 BTN_W, VALUE_W, AUX_W, GAMMA = 1.5, 0.5, 1.0, 0.99
-N_STACK = 4
+N_STACK = 8     # 60Гц/стек-8 — как у текущих моделей; гвард в reverse_transfer проверит совпадение
 LAG_P = (0.4, 0.35, 0.25)      # баланс лага: лечит катастрофы lag=2
 
 
 def reverse_transfer(net, ck, dev):
     """PPO -> BCNet + инлайн-гейт совпадения (= reverse_check)."""
     m = PPO.load(ck, device="cpu")
+    base_k = int(m.policy.features_extractor.cnn[0].in_channels)
+    if base_k != N_STACK:
+        raise SystemExit(
+            f"!! База {ck} учится на стеке {base_k}, а DAgger собран на N_STACK={N_STACK}.\n"
+            f"   Возьми --base из 60Гц-линии (стек 8) либо поменяй N_STACK на {base_k}.")
     pol = m.policy
     net.cnn.load_state_dict(pol.features_extractor.cnn.state_dict())
     net.linear.load_state_dict(pol.features_extractor.linear[0].state_dict())

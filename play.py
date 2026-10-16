@@ -1,4 +1,6 @@
 import argparse
+import glob
+import os
 import time
 import threading
 import ctypes
@@ -37,6 +39,29 @@ class Stacker:
     def push(self, obs):
         self.buf = np.concatenate([self.buf[:, :, 1:], obs], axis=2)
         return self.buf
+
+
+def infer_stack(model):
+    """Сколько кадров ждёт сеть: 8 = 60Гц-линия, 4 = старые 30Гц-модели.
+    Читаем прямо из первой свёртки политики, чтобы play НИКОГДА больше
+    не расходился с тренировкой (краш октября: Stacker(4) против стек-8)."""
+    try:
+        return int(model.policy.features_extractor.cnn[0].in_channels)
+    except Exception:
+        sh = tuple(model.observation_space.shape)
+        if sh[1:] == (120, 160):
+            return int(sh[0])      # CHW: (8,120,160)
+        if sh[:2] == (120, 160):
+            return int(sh[2])      # HWC: (120,160,8)
+        return 8                   # текущая 60Гц-линия
+
+
+def _pick_default_model():
+    """Без --model: свежий .zip по дате изменения."""
+    pats = ("best_*/*.zip", "*_final.zip", "bc_policy*.zip",
+            "*_guard.zip", "*_interrupted.zip", "checkpoints_*/*_steps.zip")
+    cands = [p for pat in pats for p in glob.glob(pat)]
+    return max(cands, key=os.path.getmtime) if cands else None
 
 
 def release_buttons(env):
@@ -97,15 +122,27 @@ def _handle_commands(model, args):
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
-    p.add_argument("--model", default="best_stage2b/stage2b_800000_steps.zip")
+    p.add_argument("--model", default=None,
+                   help="путь к .zip; без него — свежий по дате (best_*, финалы, bc_policy, чекпоинты)")
+    p.add_argument("--stack", type=int, default=0,
+                   help="стек кадров; 0 = авто из первой свёртки модели")
     p.add_argument("--stochastic", action="store_true")
     args = p.parse_args()
+
+    if not args.model:
+        args.model = _pick_default_model()
+        if not args.model:
+            raise SystemExit("Ни одного .zip не нашёл — запусти с --model путь/к/модели.zip")
+        print(f"[play] --model не задан, беру свежий по дате: {args.model}")
 
     threading.Thread(target=_stop_listener, daemon=True).start()
 
     env = OsuEnv()
     model = PPO.load(args.model, device="cpu")
-    stack = Stacker(4)
+    K = args.stack if args.stack > 0 else infer_stack(model)
+    stack = Stacker(K)
+    print(f"[play] {args.model} | стек {K} кадров | "
+          f"{'stochastic' if args.stochastic else 'det'} | F8 = стоп")
 
     in_game, ep, total = False, 0, 0.0
     last_t, frozen, last_num = None, 0, None
