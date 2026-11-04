@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+pf_calib.json
+best_bcft
+best_stage2
+best_stage2b
+checkpoints_stage4
+sim_maps
+sim_maps_eval
+sim_maps_eval_t1
+sim_maps_t1
+bc_policy.zip
