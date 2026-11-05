@@ -1,6 +1,8 @@
 __pycache__/
 *.pyc
 pf_calib.json
+telemetry_*.json
+monitor_command.json
 best_bcft
 best_stage2
 best_stage2b

@@ -24,7 +24,7 @@ from core import TOSU_URL
 user32 = ctypes.windll.user32
 
 # ============================================================
-# MAIN (standalone viewer) — запускается ТОЛЬКО как `python vision.py`
+# MAIN (standalone viewer) — запускается ТОЛЬКО как `python viewer.py`
 # При import vision этот блок не выполняется.
 # ============================================================
 if __name__ == "__main__":

@@ -17,6 +17,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 from sim_env import SimOsuEnv
 from cli import ask, ask_int, ask_float
+from models import infer_stack_file
 
 try:                      # монитор необязателен: без него обучение не меняется
     import ai_telemetry
@@ -28,7 +29,7 @@ TB_LOG_DIR = "logs_sim"
 # SB3: eval_freq/save_freq считаются в ВЫЗОВАХ vec-env.
 # 20_000 вызовов * 10 env = 200k шагов среды между событиями.
 EVAL_EVERY = 20_000
-N_STACK = 4
+N_STACK = 8     # старт с нуля; при --resume стек берётся из весов
 try:
     import tqdm   # noqa: F401
     import rich   # noqa: F401
@@ -233,6 +234,10 @@ if __name__ == "__main__":
     p.add_argument("--name", default="stage2")
     p.add_argument("--hr", type=float, default=0.0, help="вероятность HR-аугментации")
     args = p.parse_args() if len(sys.argv) > 1 else interactive()
+
+    if args.resume:
+        N_STACK = infer_stack_file(args.resume)
+    print(f"[stack] N_STACK={N_STACK}" + (" (из весов)" if args.resume else " (с нуля)"))
 
     # --- карты ---
     paths = build_pool(args.pool)

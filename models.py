@@ -37,6 +37,17 @@ def infer_stack(model):
         return 8                   # текущая 60Гц-линия
 
 
+def infer_stack_file(path):
+    """Стек сети по файлу: .zip (PPO-модель) или .pt (state_dict BCNet).
+    train_stage/dagger_train берут стек из весов, а не из константы."""
+    if path.endswith(".pt"):
+        import torch
+        sd = torch.load(path, map_location="cpu")
+        return int(sd["cnn.0.weight"].shape[1])
+    from stable_baselines3 import PPO
+    return infer_stack(PPO.load(path, device="cpu"))
+
+
 if __name__ == "__main__":
     # Инвентаризация (бывший census.py): obs-форма -> стек, число шагов.
     from stable_baselines3 import PPO

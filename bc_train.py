@@ -29,12 +29,17 @@ VALUE_W     = 0.5          # вес критика
 AUX_W       = 1.0          # AUX: вес головы «вектор к цели»
 GAMMA       = 0.99
 OUT = "bc_policy_fresh"
-N_STACK = 4
+N_STACK = 8     # 60Гц/стек-8 — единая линия; потребители читают стек из весов (CHANGES-STAGE3.md)
 
 
 def main():
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     print("device:", dev)
+    if dev != "cuda":
+        print("!! GPU не найден — обучение пойдёт на CPU (в разы дольше).")
+        print("   Лечение (NVIDIA):")
+        print("   pip uninstall -y torch")
+        print("   pip install torch --index-url https://download.pytorch.org/whl/cu124")
     maps = sorted(glob.glob("sim_maps/*.osu")) + sorted(glob.glob("sim_maps_t1/*.osu"))
     assert maps, "нет карт в sim_maps"
 
@@ -42,6 +47,7 @@ def main():
     net = BCNet(n_stack=N_STACK).to(dev)
     opt = torch.optim.Adam(net.parameters(), lr=LR)
 
+    print(f"[ram] кольцевой буфер ~{BUF_SIZE * 120 * 160 * N_STACK / 1e9:.1f} ГБ ОЗУ")
     buf_obs = np.zeros((BUF_SIZE, 120, 160, N_STACK), dtype=np.uint8)
     buf_move = np.zeros(BUF_SIZE, dtype=np.int64)
     buf_btn = np.zeros(BUF_SIZE, dtype=np.int64)
@@ -238,8 +244,13 @@ def main():
         x = torch.from_numpy(s).to(dev).permute(2, 0, 1).unsqueeze(0).float()
         with torch.no_grad():
             d = m2.policy.get_distribution(x)
-            bl, _, _, _ = net(x / 255.0)
-        maxd = max(maxd, (d.distribution[0].logits - bl).abs().max().item())
+            bl, bb, _, _ = net(x / 255.0)
+        # torch Categorical нормализует логиты (вычитает logsumexp):
+        # сравнение с сырыми логитами BCNet давало ложные ~3.3 даже при
+        # побитово точном переносе. Сравниваем log_softmax (move + btn).
+        maxd = max(maxd,
+                   (d.distribution[0].logits - F.log_softmax(bl, -1)).abs().max().item(),
+                   (d.distribution[1].logits - F.log_softmax(bb, -1)).abs().max().item())
 
     print(f"самопроверка переноса: move {match_m:.3f} | btn {match_b:.3f} "
           f"| value corr {v_corr:.3f} | max |Δlogits| {maxd:.5f} "

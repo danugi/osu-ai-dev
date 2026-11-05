@@ -1,4 +1,4 @@
-# dagger_train.py — одна итерация DAgger на 60Гц-семантике деплоя (env.py as-is)»
+# dagger_train.py — одна итерация DAgger на 60Гц-семантике деплоя (env.py as-is)
 # iter1: python dagger_train.py --iter 1 --base <свежая модель 60Гц/стек-8> --oracle-share 0.5
 # iter2: python dagger_train.py --iter 2 --resume-bc dagger_iter1_bcnet.pt --oracle-share 0.33
 # iter3: python dagger_train.py --iter 3 --resume-bc dagger_iter2_bcnet.pt --oracle-share 0.2
@@ -11,12 +11,13 @@ import torch.nn.functional as F
 from sim_env import SimOsuEnv
 from oracle import oracle_policy, aux_target
 from net import BCNet, bcnet_to_ppo, reverse_transfer
+from models import infer_stack_file
 
 # ---- настройки: всё, кроме источника данных, — как в bc_train ----
 TRAIN_EVERY, BATCH, LR, WARMUP, BUF_SIZE = 4, 256, 3e-4, 2048, 30_000
 ACT_NOISE_ORACLE = 0.03        # шум исполнения ТОЛЬКО в oracle-эпизодах
 BTN_W, VALUE_W, AUX_W, GAMMA = 1.5, 0.5, 1.0, 0.99
-N_STACK = 8     # 60Гц/стек-8 — как у текущих моделей; гвард в reverse_transfer проверит совпадение
+N_STACK = 8     # по умолчанию (from-scratch); при --base/--resume-bc стек читается из весов
 LAG_P = (0.4, 0.35, 0.25)      # баланс лага: лечит катастрофы lag=2
 
 
@@ -30,7 +31,19 @@ def main():
     p.add_argument("--teleport-p", type=float, default=0.01)
     args = p.parse_args()
 
+    if args.resume_bc:
+        N_STACK = infer_stack_file(args.resume_bc)
+    elif args.base:
+        N_STACK = infer_stack_file(args.base)
+    print(f"[stack] N_STACK={N_STACK}")
+
     dev = "cuda" if torch.cuda.is_available() else "cpu"
+    print("device:", dev)
+    if dev != "cuda":
+        print("!! GPU не найден — обучение пойдёт на CPU (в разы дольше).")
+        print("   Лечение (NVIDIA):")
+        print("   pip uninstall -y torch")
+        print("   pip install torch --index-url https://download.pytorch.org/whl/cu124")
     maps = sorted(glob.glob("sim_maps/*.osu")) + sorted(glob.glob("sim_maps_t1/*.osu"))
     assert maps, "нет карт"
 
