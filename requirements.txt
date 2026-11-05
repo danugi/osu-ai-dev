@@ -1,0 +1,22 @@
+# osu-ai-dev — зависимости (Windows, NVIDIA GPU). Python 3.10+.
+#
+# ВАЖНО про torch: обычный `pip install torch` на Windows ставит сборку
+# БЕЗ GPU (обучение напечатает device: cpu и будет в разы медленнее).
+# Поэтому ниже подключён CUDA-индекс и ограничен диапазон версий, чтобы
+# pip не утащил CPU-сборку с PyPI. Если всё же device: cpu — лечение:
+#   pip uninstall -y torch
+#   pip install torch --index-url https://download.pytorch.org/whl/cu124
+--extra-index-url https://download.pytorch.org/whl/cu124
+
+numpy>=1.24
+gymnasium>=0.29
+stable-baselines3>=2.3
+torch>=2.2,<2.7
+opencv-python>=4.8
+requests>=2.28
+tensorboard>=2.14
+
+# Необязательные:
+#   tqdm + rich — прогресс-бар train_stage.py
+#   websockets  — monitor.py (веб-морда телеметрии)
+#   pillow      — pf_calib.py (калибровка игрового поля)
