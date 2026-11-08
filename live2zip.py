@@ -31,7 +31,14 @@ def main():
     net = BCNet(n_stack=n_stack)
     net.load_state_dict(torch.load(src, map_location="cpu"))
     out = src[:-3] if src.endswith(".pt") else src + "_conv"
-    bcnet_to_ppo(net, maps, n_stack, "cpu", out)
+    if n_stack == 8:
+        bcnet_to_ppo(net, maps, n_stack, "cpu", out)
+    else:
+        # coords-стеки (10/11/12/13 каналов): обёртка CoordStackEnv вместо
+        # VecFrameStack — семантика та же, каналы доп-плоскостей из env
+        from coords import bcnet_to_ppo_wrap
+        bcnet_to_ppo_wrap(net, maps, n_stack, "cpu", out)
+        print(f"[coords] стек {n_stack} каналов — PPO собран через CoordStackEnv")
 
     # самопроверка переноса (как reverse-check в dagger_train): argmax BCNet == predict PPO
     m = PPO.load(out, device="cpu")

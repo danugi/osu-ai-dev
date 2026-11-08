@@ -16,6 +16,7 @@ acc в teacher-forced режиме всегда ≈ 1.0 по построени�
 
 Запуск:
   python dagger_gap.py model.zip --maps sim_maps --steps 4000
+  python dagger_gap.py model_bcnet.pt --maps sim_maps --steps 4000   # без PPO
   python dagger_gap.py ORACLE --maps sim_maps --steps 500   # санити: разрыв 0
 """
 import argparse
@@ -30,6 +31,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from sim_env import SimOsuEnv
 from oracle import oracle_policy
 from core import decode_move
+from models import infer_stack_file
+from coords import make_pusher
 
 # пороги вердикта v2 (osu-px)
 NAV_TF_OK = 15.0   # подражание учителю: nav med на его траекториях
@@ -39,8 +42,23 @@ ACC_DEAD = 0.1     # ниже — «цикл мёртв» (при здорово
 
 
 def load_predictor(name, det):
+    """-> (policy(env, stack) -> [midx, btn], метка). .zip через PPO,
+    .pt напрямую через BCNet (обходит вопросы нормализации SB3)."""
     if name.upper() == "ORACLE":
         return lambda env, s: np.array(oracle_policy(env), dtype=np.int64), "ORACLE"
+    if name.endswith(".pt"):
+        import torch
+        from net import BCNet
+        ns = infer_stack_file(name)
+        net = BCNet(n_stack=ns)
+        net.load_state_dict(torch.load(name, map_location="cpu"))
+        net.eval()
+        def policy_pt(env, s):
+            x = torch.from_numpy(s).permute(2, 0, 1).unsqueeze(0).float().div(255.0)
+            with torch.no_grad():
+                lm, lb, _, _ = net(x)
+            return np.array([int(lm.argmax()), int(lb.argmax())], dtype=np.int64)
+        return policy_pt, f"{os.path.basename(name)} (.pt, стек {ns})"
     from stable_baselines3 import PPO
     model = PPO.load(name, device="cpu")
     def policy(env, s):
@@ -49,14 +67,15 @@ def load_predictor(name, det):
     return policy, os.path.basename(name)
 
 
-def measure(maps, policy, driver, steps, seed=2024, act_noise=0.03):
+def measure(maps, policy, driver, steps, seed=2024, act_noise=0.03,
+           n_stack=8, lag_p=(0.65, 0.35, 0.0)):
     """driver: 'oracle' | 'policy'. Возвращает per-step записи."""
     env = SimOsuEnv(maps, domain_rand=True)
     obs, _ = env.reset(seed=seed)
-    env._lag = int(env.np_random.choice(2, p=[0.65, 0.35]))   # как bc_train
+    env._lag = int(env.np_random.choice(3, p=lag_p))
     env._press_off = 10.0
-    n_stack = 8
-    stack = np.repeat(obs, n_stack, axis=2)
+    _, pushf, s0f = make_pusher(n_stack)     # coords-стек по числу каналов
+    stack = s0f(obs, env)
     recs = []
     for step in range(steps):
         midx, btn = oracle_policy(env)             # метка — всегда оракул
@@ -76,14 +95,14 @@ def measure(maps, policy, driver, steps, seed=2024, act_noise=0.03):
         else:
             exec_midx, exec_btn = pm, pb
         obs, r, term, trunc, info = env.step(np.array([exec_midx, exec_btn], dtype=np.int64))
-        stack = np.concatenate([stack[:, :, 1:], obs], axis=2)
+        stack = pushf(stack, obs, env)
         if info:
             recs[-1]["acc"] = info.get("acc")
         if term or trunc:
             obs, _ = env.reset()
-            env._lag = int(env.np_random.choice(2, p=[0.65, 0.35]))
+            env._lag = int(env.np_random.choice(3, p=lag_p))
             env._press_off = 10.0
-            stack = np.repeat(obs, n_stack, axis=2)
+            stack = s0f(obs, env)
     return recs
 
 
@@ -112,16 +131,25 @@ def main():
     p.add_argument("--maps", default="sim_maps")
     p.add_argument("--steps", type=int, default=4000)
     p.add_argument("--seed", type=int, default=2024)
+    p.add_argument("--lag-p", default="0.65,0.35,0",
+                   help="распределение лага 0/1/2 (дефолт — как старый bc_train, "
+                        "для сравнимости; линия bc3: 0.4,0.35,0.25)")
     args = p.parse_args()
+    lag_p = tuple(float(x) for x in args.lag_p.split(","))
+    assert len(lag_p) == 3 and abs(sum(lag_p) - 1.0) < 1e-6, "--lag-p: три доли, сумма 1"
 
     maps = sorted(glob.glob(os.path.join(args.maps, "*.osu")))
     assert maps, "нет карт в " + args.maps
     policy, name = load_predictor(args.model, det=True)
+    n_stack = 8 if args.model.upper() == "ORACLE" else infer_stack_file(args.model)
 
-    print(f"=== DAgger-разрыв: {name} | {args.maps} | {args.steps} шагов ===")
-    tf = report(name, measure(maps, policy, "oracle", args.steps, seed=args.seed),
+    print(f"=== DAgger-разрыв: {name} | {args.maps} | {args.steps} шагов "
+          f"| лаг {lag_p} ===")
+    tf = report(name, measure(maps, policy, "oracle", args.steps, seed=args.seed,
+                              n_stack=n_stack, lag_p=lag_p),
                 "teacher-forced: оракул ведёт")
-    cl = report(name, measure(maps, policy, "policy", args.steps, seed=args.seed),
+    cl = report(name, measure(maps, policy, "policy", args.steps, seed=args.seed,
+                              n_stack=n_stack, lag_p=lag_p),
                 "closed-loop: политика ведёт сама")
 
     print(f"\nРАЗРЫВ: move {tf['am']:.3f} -> {cl['am']:.3f} ({_sgn(tf['am']-cl['am'])}) | "

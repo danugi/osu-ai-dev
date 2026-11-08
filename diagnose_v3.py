@@ -33,6 +33,7 @@ import numpy as np
 from core import DT_MS, decode_move
 from sim_env import SimOsuEnv
 from oracle import oracle_policy
+from coords import make_pusher, coord_planes, N_GAME
 
 try:
     from stable_baselines3 import PPO
@@ -61,6 +62,9 @@ def parse_args():
                    help="своя сетка, напр. '0.98,0.99,1.0,1.01' (для lag: '0,1,2')")
     p.add_argument("--sweep-n", type=int, default=10, help="сидов на точку сетки")
     p.add_argument("--csv", default=None)
+    p.add_argument("--lag-p", default=None,
+                   help="распределение лага 0/1/2 для rand-режима, напр. 0.4,0.35,0.25; "
+                        "по умолчанию — дефолт среды (0.6,0.3,0.1), как в старых замерах")
     return p.parse_args()
 
 
@@ -75,6 +79,22 @@ def make_policy(name, det, seed0):
             return np.array([int(rng.integers(0, 27)), int(rng.integers(0, 5))],
                             dtype=np.int64)
         return random_policy, "RANDOM", 0
+    if name.endswith(".pt"):
+        # BCNet напрямую, без PPO/SB3: обходит вопросы нормализации и
+        # поддерживает coords-стеки (10/11/12/13 каналов).
+        import torch
+        from net import BCNet
+        from models import infer_stack_file
+        ns = infer_stack_file(name)
+        net = BCNet(n_stack=ns)
+        net.load_state_dict(torch.load(name, map_location="cpu"))
+        net.eval()
+        def policy_pt(env, s):
+            x = torch.from_numpy(s).permute(2, 0, 1).unsqueeze(0).float().div(255.0)
+            with torch.no_grad():
+                lm, lb, _, _ = net(x)
+            return np.array([int(lm.argmax()), int(lb.argmax())], dtype=np.int64)
+        return policy_pt, os.path.basename(name), ns
     if PPO is None:
         raise SystemExit("модель требует stable_baselines3 (нет в окружении)")
     model = PPO.load(name, device="cpu")
@@ -88,9 +108,11 @@ def make_policy(name, det, seed0):
 # ---------------------------------------------------------------- стек
 def build_stack(env, obs0, n_stack, warmup):
     """Стек на старте. warmup=0 → repeat (как v2/bc_train). warmup=N>0 → N кадров
-    прошлого (рендер при sim_time-k*DT_MS, состояние не трогаем) + текущий."""
+    прошлого (рендер при sim_time-k*DT_MS, состояние не трогаем) + текущий.
+    coords-стеки: игровая часть всегда 8 каналов, доп-каналы — текущие."""
+    mode, pushf, s0f = make_pusher(n_stack)
     if warmup <= 0:
-        return np.repeat(obs0, n_stack, axis=2)
+        return s0f(obs0, env)
     t0 = env.sim_time
     frames = []
     for k in range(warmup, 0, -1):
@@ -98,50 +120,63 @@ def build_stack(env, obs0, n_stack, warmup):
         frames.append(env._render())
     env.sim_time = t0
     frames.append(obs0)
-    frames = frames[-n_stack:]
-    if len(frames) < n_stack:
-        pad = np.repeat(frames[0], n_stack - len(frames), axis=2)
-        return np.concatenate([pad] + frames, axis=2)
-    return np.concatenate(frames, axis=2)
+    frames = frames[-N_GAME:]
+    if len(frames) < N_GAME:
+        pad = np.repeat(frames[0], N_GAME - len(frames), axis=2)
+        frames = [pad] + frames
+    game = np.concatenate(frames, axis=2)
+    if n_stack == N_GAME:
+        return game
+    h, w = game.shape[:2]
+    return np.concatenate([game, coord_planes(env, mode, h, w)], axis=2)
 
 
 # ---------------------------------------------------------------- эпизод
 def run_episode(policy, maps, seed, det, clean, warmup, n_stack,
-                override=None):
+                override=None, lag_p=None):
     """Один сегмент. override — dict вида {'scale': 1.02, ...}: выставляется
-    после reset (для sweep), остальные оси чистые."""
+    после reset (для sweep), остальные оси чистые. lag_p — распределение
+    лага 0/1/2 для rand-режима (None = дефолт среды, как раньше)."""
     env = SimOsuEnv(maps, domain_rand=not clean)
     obs, _ = env.reset(seed=seed)
     start_t = env.sim_time
     if clean:                        # НАСТОЯЩИЙ чистый (v2 оставлял press_off=10)
         env._lag, env._scale, env._press_off, env._noise = 0, 1.0, 0.0, 0.0
+    elif lag_p is not None:
+        env._lag = int(env.np_random.choice(3, p=lag_p))
     if override:
         for k, v in override.items():
             setattr(env, "_%s" % k, v)
 
+    _, pushf, _ = make_pusher(n_stack)
+
     # --- per-object журнал: хуки судейства ---
-    hits, presses = {}, []           # i -> (pt, head); [(pt, cx, cy)]
+    hits, presses = {}, []           # i -> (pt, head); [(pt, cx, cy, d_goal)]
     _jh, _jp = env._judge_hit, env._judge_press
     def jh(i, pt, head):
         hits[i] = (pt, head); _jh(i, pt, head)
     def jp(pt):
-        presses.append((pt, env.cursor_x, env.cursor_y)); _jp(pt)
+        g = env._goal()
+        d = math.hypot(g[0] - env.cursor_x, g[1] - env.cursor_y) if g else float("nan")
+        presses.append((pt, env.cursor_x, env.cursor_y, d)); _jp(pt)
     env._judge_hit, env._judge_press = jh, jp
     min_aim = {}                     # i -> мин. дистанция курсор-центр в окне
 
     cut0 = bisect_right(env.object_times, start_t)   # объекты до старта — skip
     s = build_stack(env, obs, n_stack, warmup)
 
-    clicks, prev_l, overlapped = 0, False, set()
+    clicks, clicks_r, prev_l, prev_r, overlapped = 0, 0, False, False, set()
     done, info = False, {}
     while not done:
         a = policy(env, s)
         obs, r, term, trunc, info = env.step(a)
-        s = np.concatenate([s[:, :, 1:], obs], axis=2)
+        s = pushf(s, obs, env)
         done = term or trunc
         if env.btn_l and not prev_l:
             clicks += 1
-        prev_l = env.btn_l
+        if env.btn_r and not prev_r:
+            clicks_r += 1
+        prev_l, prev_r = env.btn_l, env.btn_r
         t, m = env.sim_time, env.cur
         lo = bisect_left(env.object_times, t - m["w50"])
         hi = bisect_right(env.object_times, t + m["w50"])
@@ -176,7 +211,7 @@ def run_episode(policy, maps, seed, det, clean, warmup, n_stack,
         else:
             continue                        # спиннеры в журнал не входят
         h = hits.get(i)
-        clicked = any(abs(pt - t_obj) <= m["w50"] for pt, _, _ in presses)
+        clicked = any(abs(pt - t_obj) <= m["w50"] for pt, _, _, _ in presses)
         recs.append({
             "i": i, "type": o["type"], "t_obj": t_obj, "hit": bool(hit),
             "clicked": clicked,
@@ -189,7 +224,10 @@ def run_episode(policy, maps, seed, det, clean, warmup, n_stack,
         "start_t": round(start_t), "lag": env._lag,
         "scale": round(env._scale, 3), "press_off": round(env._press_off, 1),
         "acc": info.get("acc", 0.0), "miss": info.get("miss", 0),
-        "clicks": clicks, "over_obj": len(overlapped),
+        "clicks": clicks, "clicks_r": clicks_r, "over_obj": len(overlapped),
+        "press_aim": (round(float(np.median([d for _, _, _, d in presses
+                                              if d == d])), 1)
+                      if presses else float("nan")),
         "r_osu": round(m["r_osu"], 1),
     }
     row.update(journal_stats(recs))
@@ -236,7 +274,9 @@ def print_summary(rows, title):
     accs = np.array([r["acc"] for r in rows], dtype=float)
     print(f"\n{title}")
     print(f"acc = {accs.mean():.3f} ± {accs.std():.3f} | miss: med={med([r['miss'] for r in rows]):.0f} "
-          f"max={max(r['miss'] for r in rows)} | кликов: med={med([r['clicks'] for r in rows]):.0f} "
+          f"max={max(r['miss'] for r in rows)} | кликов Л/П: med={med([r['clicks'] for r in rows]):.0f}"
+          f"/{med([r['clicks_r'] for r in rows]):.0f} "
+          f"| прицел в момент клика: med={med([r['press_aim'] for r in rows]):.0f}px "
           f"| над объектом: med={med([r['over_obj'] for r in rows]):.0f}")
     r_osu = med([r["r_osu"] for r in rows])
     aim_m, aim_p = med([r["aim_med"] for r in rows]), med([r["aim_p90"] for r in rows])
@@ -331,10 +371,15 @@ def main():
         return
 
     rows = []
+    lag_p = (tuple(float(x) for x in args.lag_p.split(","))
+             if args.lag_p else None)
+    if lag_p is not None:
+        assert len(lag_p) == 3 and abs(sum(lag_p) - 1.0) < 1e-6, "--lag-p: три доли, сумма 1"
     for ep in range(args.n):
         seed = 1000 + ep
         row = run_episode(policy, maps, seed, args.mode == "det",
-                          args.domain == "clean", args.warmup, n_stack)
+                          args.domain == "clean", args.warmup, n_stack,
+                          lag_p=lag_p)
         rows.append(row)
         print({k: row[k] for k in ("seed", "map", "start_t", "lag", "scale",
                                    "press_off", "acc", "miss", "clicks", "over_obj")},

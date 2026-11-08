@@ -50,6 +50,7 @@ from oracle import oracle_policy
 from core import decode_move, MOVE_DISTANCES, DIRS
 from vision import OSU_W, OSU_H
 from models import infer_stack_file
+from coords import make_pusher
 
 N_DIRS = len(DIRS)                    # 9
 BUCKETS = [(0.0, 25.0, "near <25"), (25.0, 50.0, "mid 25-50"),
@@ -112,18 +113,24 @@ def main():
     p.add_argument("--seed", type=int, default=2024)
     p.add_argument("--tp-every", type=int, default=3,
                    help="телепорт каждые N шагов (0 = контроль без телепортов)")
+    p.add_argument("--lag-p", default="0.65,0.35,0",
+                   help="распределение лага 0/1/2 (по умолчанию — как старый bc_train, "
+                        "для сравнимости; новая линия bc3: 0.4,0.35,0.25)")
     args = p.parse_args()
+    lag_p = tuple(float(x) for x in args.lag_p.split(","))
+    assert len(lag_p) == 3 and abs(sum(lag_p) - 1.0) < 1e-6, "--lag-p: три доли, сумма 1"
 
     maps = sorted(glob.glob(os.path.join(args.maps, "*.osu")))
     assert maps, "нет карт в " + args.maps
     predict, label = load_predictor(args.model)
     n_stack = 8 if args.model.upper() == "ORACLE" else infer_stack_file(args.model)
+    _, pushf, s0f = make_pusher(n_stack)     # coords-стек (8/10/11/12/13 каналов)
 
     env = SimOsuEnv(maps, domain_rand=True)
     obs, _ = env.reset(seed=args.seed)
-    env._lag = int(env.np_random.choice(2, p=[0.65, 0.35]))
+    env._lag = int(env.np_random.choice(3, p=lag_p))
     env._press_off = 10.0
-    stack = np.repeat(obs, n_stack, axis=2)
+    stack = s0f(obs, env)
     CUR[0] = env
 
     rows = []
@@ -133,7 +140,7 @@ def main():
             env.cursor_x = float(env.np_random.uniform(40, OSU_W - 40))
             env.cursor_y = float(env.np_random.uniform(40, OSU_H - 40))
             frz = env._render()
-            stack = np.concatenate([stack[:, :, 1:], frz], axis=2)
+            stack = pushf(stack, frz, env)
 
         g = env._goal()
         if g is not None:
@@ -149,12 +156,12 @@ def main():
         # --- исполняем всегда ОРАКУЛ: эпизод остаётся живым/типовым ---
         midx, btn = oracle_policy(env)
         obs, r, term, trunc, info = env.step(np.array([midx, btn], dtype=np.int64))
-        stack = np.concatenate([stack[:, :, 1:], obs], axis=2)
+        stack = pushf(stack, obs, env)
         if term or trunc:
             obs, _ = env.reset()
-            env._lag = int(env.np_random.choice(2, p=[0.65, 0.35]))
+            env._lag = int(env.np_random.choice(3, p=lag_p))
             env._press_off = 10.0
-            stack = np.repeat(obs, n_stack, axis=2)
+            stack = s0f(obs, env)
 
     # ------------------------------------------------------------ статистика
     print(f"\n=== far_probe: {label} | {args.maps} | steps={args.steps} "
@@ -185,7 +192,9 @@ def main():
                         for r in rs])
         spdh = np.mean([(r["pred"] // N_DIRS) == (r["lab"] // N_DIRS) for r in rs])
         stand = np.mean([decode_move(r["pred"])[0] == (0, 0) for r in rs])
-        if hi >= 50:                       # far+xfar -> пул для вердикта
+        if lo >= 50:                       # far+xfar -> пул для вердикта
+            # (v1.1: было hi >= 50 — затягивало бакет mid 25-50, чей hi ровно 50;
+            #  аудит поймал по расхождению n: 3403 строк против 3678 углов)
             far_pool["mv"] += e_lab
             far_pool["au"] += e_aux
         f = (lambda v: f"{np.median(v):5.0f}г p90 {np.percentile(v, 90):5.0f}г"
