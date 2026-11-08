@@ -12,3 +12,8 @@ sim_maps_eval
 sim_maps_eval_t1
 sim_maps_t1
 bc_policy.zip
+bc_test.zip
+bc_test_bcnet.pt
+sim_maps.zip
+bc_policy_fresh.zip
+bc_policy_fresh_bcnet.pt
