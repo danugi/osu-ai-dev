@@ -1,5 +1,29 @@
 # dagger_train2.py — DAgger v3 (попытка В): плотность А + свежесть Б + фабрика ближних состояний.
 #
+# ============ АПДЕЙТ 2026-11-08: линия bc3 (coords + oracle_v4) ============
+# far_probe по bc3_policy ПРОЙДЕН: xfar уг(move~метка) 0г / bin 0.52 / aux 14г
+# (старая линия: 45г / 0.17-0.35 / aux мертва 42-93г); cl nav 9px против
+# 66-68px у всех пяти старых прогонов; acc 0.182±0.128 (v3, 30 сидов).
+# Стена «далеко -> поверни к цели» сломана coords-каналами. Этот скрипт
+# обновлён под новую линию:
+#   - стек: coords.make_pusher(N_STACK) — 8 кадров + каналы cursor/goal/btn
+#     (стек читается из весов; 8 = контроль bc3_ctrl, 12 = bc3_policy);
+#   - учитель меток: oracle_v4 (--teacher v4, дефолт; v3 — для весов СТАРОЙ
+#     линии до bc3, у них другие btn-метки);
+#   - пробник: лаг 0.4/0.35/0.25 (было 0.65/0.35 — числа старых проб не
+#     сравнивать напрямую);
+#   - финальный перенос: стек != 8 собирается через CoordStackEnv.
+# Новый ботлнек по bc3_policy (воронка diagnose): 31 объект -> над объектом
+# в окне 13 -> кликов 8 -> хитов 6; first_miss #0 почти везде. Это тайминг
+# прибытия и клик-триггер — ровно то, что лечат метки на СОБСТВЕННЫХ
+# состояниях политики (DAgger), а не данные оракула.
+#
+# Запуск (новая линия, ~3-4.5 ч на GTX-классе GPU):
+#   python dagger_train2.py --iter 1 --resume-bc bc3_policy_bcnet.pt
+#   (дефолты: 300k шагов, oracle-share 0.33, чанк 20k x 32 эп, probe 2000;
+#    live-чекпоинт после каждого чанка — замер через live2zip без остановки)
+# iter2 дальше: --resume-bc dagger2_iter1_bcnet.pt --oracle-share 0.2
+#
 # ИСТОРИЯ (30 сидов, det rand, sim_maps):
 #   Попытка А (dagger_train.py, кольцо 30k, ~64 прохода/кадр, 200k шагов):
 #     ЛУЧШАЯ по замкнутому циклу — acc 0.123±0.073, aim 26/68px, recovery 0.23;
@@ -44,11 +68,21 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from sim_env import SimOsuEnv
-from oracle import oracle_policy, aux_target
 from net import BCNet, bcnet_to_ppo
 from models import infer_stack_file
 from core import decode_move
 from vision import OSU_W, OSU_H
+from coords import make_pusher
+
+
+def load_teacher(which):
+    """Учитель меток: v4 = oracle_v4 (машина состояний кнопок, линия bc3+),
+    v3 = oracle (старая линия; MOVE-метки идентичны, BTN-метки другие)."""
+    if which == "v4":
+        from oracle_v4 import oracle_policy, aux_target
+    else:
+        from oracle import oracle_policy, aux_target
+    return oracle_policy, aux_target
 
 # ---- настройки по умолчанию = рецепт попытки В ----
 STEPS, CHUNK, EPOCHS = 300_000, 20_000, 32
@@ -60,14 +94,16 @@ BTN_W, VALUE_W, AUX_W, GAMMA = 1.5, 0.5, 1.0, 0.99
 LAG_P = (0.4, 0.35, 0.25)      # баланс лага: лечит катастрофы lag=2
 
 
-def probe(net, maps, n_stack, n_steps, seed, dev):
+def probe(net, maps, n_stack, n_steps, seed, dev, oracle_policy):
     """Быстрый замер замкнутого цикла (det argmax) на свежем окружении.
-    Тот же seed каждый раз -> числа сравнимы между чанками."""
+    Тот же seed каждый раз -> числа сравнимы между чанками. Лаг — как в
+    сборе (LAG_P), coords-стек — через make_pusher."""
     env = SimOsuEnv(maps, domain_rand=True)
     obs, _ = env.reset(seed=seed)
-    env._lag = int(env.np_random.choice(2, p=[0.65, 0.35]))
+    env._lag = int(env.np_random.choice(3, p=LAG_P))
     env._press_off = 10.0
-    stack = np.repeat(obs, n_stack, axis=2)
+    _, pushf, s0f = make_pusher(n_stack)
+    stack = s0f(obs, env)
     nav, accs = [], []
     for _ in range(n_steps):
         midx, btn = oracle_policy(env)
@@ -81,14 +117,14 @@ def probe(net, maps, n_stack, n_steps, seed, dev):
         v2 = np.array([d2[0] * s2, d2[1] * s2], dtype=np.float64)
         nav.append(float(np.hypot(*(v1 - v2))))
         obs, r, term, trunc, info = env.step(np.array([pm, pb], dtype=np.int64))
-        stack = np.concatenate([stack[:, :, 1:], obs], axis=2)
+        stack = pushf(stack, obs, env)
         if info:
             accs.append(info.get("acc"))
         if term or trunc:
             obs, _ = env.reset()
-            env._lag = int(env.np_random.choice(2, p=[0.65, 0.35]))
+            env._lag = int(env.np_random.choice(3, p=LAG_P))
             env._press_off = 10.0
-            stack = np.repeat(obs, n_stack, axis=2)
+            stack = s0f(obs, env)
     return float(np.median(nav)), (float(np.mean(accs)) if accs else None), len(accs)
 
 
@@ -109,10 +145,21 @@ def main():
                    help="шагов автопробника после чанка (0 = выкл)")
     p.add_argument("--maps", default="sim_maps,sim_maps_t1",
                    help="папки с картами через запятую")
+    p.add_argument("--teacher", choices=["v4", "v3"], default="v4",
+                   help="учитель МЕТОК: v4 = oracle_v4 (линия bc3+, дефолт); "
+                        "v3 = старая линия (веса до bc3; MOVE-метки те же, "
+                        "BTN другие — смешивать нельзя)")
     args = p.parse_args()
 
     N_STACK = infer_stack_file(args.resume_bc)
-    print(f"[stack] N_STACK={N_STACK}")
+    mode, pushf, s0f = make_pusher(N_STACK)
+    oracle_policy, aux_target = load_teacher(args.teacher)
+    print(f"[stack] N_STACK={N_STACK} (coords={mode}) | учитель: oracle_{args.teacher}")
+    if args.teacher == "v4" and N_STACK == 8:
+        print("[i] стек 8 + v4: норм для bc3_ctrl (контроль); если это веса "
+              "СТАРОЙ линии (bc_policy*/dagger2*) — перезапусти с --teacher v3")
+    if args.teacher == "v3" and N_STACK != 8:
+        raise SystemExit("v3-учитель только для старой линии (стек 8)")
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     print("device:", dev)
     if dev != "cuda":
@@ -155,7 +202,7 @@ def main():
     env._press_off = 10.0
     driver = "oracle" if env.np_random.random() < args.oracle_share else "policy"
     comp["ep_oracle" if driver == "oracle" else "ep_policy"] += 1
-    stack = np.repeat(obs, N_STACK, axis=2)
+    stack = s0f(obs, env)
 
     last_info = {}
     t0 = time.time()
@@ -238,7 +285,7 @@ def main():
                 env.cursor_y = min(OSU_H - 20.0, max(20.0, g[1] + math.sin(ang) * dist))
 
         obs, r, term, trunc, info = env.step(np.array([exec_midx, exec_btn], dtype=np.int64))
-        stack = np.concatenate([stack[:, :, 1:], obs], axis=2)
+        stack = pushf(stack, obs, env)
         ch_r[fill] = r
         ch_done[fill] = float(term or trunc)
         fill += 1
@@ -264,7 +311,7 @@ def main():
             env._press_off = 10.0
             driver = "oracle" if env.np_random.random() < args.oracle_share else "policy"
             comp["ep_oracle" if driver == "oracle" else "ep_policy"] += 1
-            stack = np.repeat(obs, N_STACK, axis=2)
+            stack = s0f(obs, env)
 
         if (step + 1) % 10_000 == 0 and fill != args.chunk:
             fp = comp["far_p"] / max(1, comp["n_p"])
@@ -278,7 +325,8 @@ def main():
             chunk_id += 1
             train_pass(args.chunk, args.epochs, f"чанк {chunk_id} x{args.epochs} эп")
             if args.probe > 0:
-                pnav, pacc, pep = probe(net, maps, N_STACK, args.probe, 2024, dev)
+                pnav, pacc, pep = probe(net, maps, N_STACK, args.probe, 2024, dev,
+                                        oracle_policy)
                 acc_s = f"{pacc:.3f}" if pacc is not None else "—"
                 print(f"[probe чанк {chunk_id}] nav med={pnav:.0f}px | acc={acc_s} "
                       f"({pep} эп)", flush=True)
@@ -305,12 +353,19 @@ def main():
     if fill >= BATCH:
         train_pass(fill, min(args.epochs, 8), f"хвост {fill} кадров x{min(args.epochs,8)} эп")
         if args.probe > 0:
-            pnav, pacc, pep = probe(net, maps, N_STACK, args.probe, 2024, dev)
+            pnav, pacc, pep = probe(net, maps, N_STACK, args.probe, 2024, dev,
+                                    oracle_policy)
             acc_s = f"{pacc:.3f}" if pacc is not None else "—"
             print(f"[probe хвост] nav med={pnav:.0f}px | acc={acc_s} ({pep} эп)", flush=True)
 
     torch.save(net.state_dict(), OUT + "_bcnet.pt")
-    bcnet_to_ppo(net, maps, N_STACK, dev, OUT)
+    if N_STACK == 8:
+        bcnet_to_ppo(net, maps, N_STACK, dev, OUT)
+    else:
+        # coords-стеки (10/11/12/13): обёртка CoordStackEnv вместо VecFrameStack
+        from coords import bcnet_to_ppo_wrap
+        bcnet_to_ppo_wrap(net, maps, N_STACK, dev, OUT)
+        print(f"[coords] стек {N_STACK} каналов — PPO собран через CoordStackEnv")
     with open(OUT + "_composition.json", "w", encoding="utf-8") as f:
         json.dump(comp, f, indent=1)
     print(f"сохранено: {OUT}.zip + {OUT}_bcnet.pt + {OUT}_composition.json")
